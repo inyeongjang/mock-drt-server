@@ -5,6 +5,8 @@ from pathlib import Path
 
 from math import asin, cos, radians, sin, sqrt
 from uuid import uuid4
+from threading import Thread
+from time import sleep
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy import select
@@ -12,12 +14,19 @@ from sqlalchemy.orm import Session
 
 from app.database import Base, SessionLocal, engine, get_db
 from app.models import Call, CallStatus, Stop, Vehicle, VehicleStatus
-from app.schemas import CallCreateRequest, CallCreateResponse
-
+from app.schemas import (
+    CallCreateRequest,
+    CallCreateResponse,
+    CallStatusResponse,
+)
 
 STOPS_CSV_PATH = Path(__file__).parent.parent / "data" / "stops.csv"
 VEHICLE_COUNT = 3
 VEHICLE_SPEED_KMH = 30.0
+
+MOVEMENT_STEPS = 10
+MOVEMENT_INTERVAL_SECONDS = 1
+ARRIVAL_WAIT_SECONDS = 2
 
 
 def load_stops_from_csv() -> list[dict[str, str | float]]:
@@ -147,6 +156,177 @@ def find_nearest_available_vehicle(
 
     return min(vehicle_distances, key=lambda item: item[1])
 
+def find_nearest_stop(
+    db: Session,
+    latitude: float,
+    longitude: float,
+) -> Stop:
+    stops = db.scalars(select(Stop)).all()
+
+    if not stops:
+        raise RuntimeError("등록된 정류장이 없습니다.")
+
+    return min(
+        stops,
+        key=lambda stop: calculate_distance_km(
+            latitude,
+            longitude,
+            stop.latitude,
+            stop.longitude,
+        ),
+    )
+
+def find_nearest_stop(
+    db: Session,
+    latitude: float,
+    longitude: float,
+) -> Stop:
+    stops = db.scalars(select(Stop)).all()
+
+    if not stops:
+        raise RuntimeError("등록된 정류장이 없습니다.")
+
+    return min(
+        stops,
+        key=lambda stop: calculate_distance_km(
+            latitude,
+            longitude,
+            stop.latitude,
+            stop.longitude,
+        ),
+    )
+
+def interpolate_position(
+    start: float,
+    end: float,
+    progress: float,
+) -> float:
+    return start + (end - start) * progress
+
+def move_vehicle_to_stop(
+    call_id: str,
+    target_stop_id: str,
+    call_status: CallStatus,
+) -> None:
+    with SessionLocal() as db:
+        call = db.get(Call, call_id)
+
+        if call is None:
+            return
+
+        vehicle = db.get(Vehicle, call.vehicle_id)
+        target_stop = db.get(Stop, target_stop_id)
+
+        if vehicle is None or target_stop is None:
+            return
+
+        start_latitude = vehicle.latitude
+        start_longitude = vehicle.longitude
+
+        call.status = call_status.value
+        db.commit()
+
+        for step in range(1, MOVEMENT_STEPS + 1):
+            progress = step / MOVEMENT_STEPS
+
+            vehicle.latitude = interpolate_position(
+                start_latitude,
+                target_stop.latitude,
+                progress,
+            )
+
+            vehicle.longitude = interpolate_position(
+                start_longitude,
+                target_stop.longitude,
+                progress,
+            )
+
+            nearest_stop = find_nearest_stop(
+                db,
+                vehicle.latitude,
+                vehicle.longitude,
+            )
+
+            vehicle.nearest_stop_id = nearest_stop.id
+
+            remaining_steps = MOVEMENT_STEPS - step
+            call.estimated_arrival_seconds = (
+                remaining_steps * MOVEMENT_INTERVAL_SECONDS
+            )
+
+            db.commit()
+
+            sleep(MOVEMENT_INTERVAL_SECONDS)
+
+def run_vehicle_trip(call_id: str) -> None:
+    with SessionLocal() as db:
+        call = db.get(Call, call_id)
+
+        if call is None:
+            return
+
+        departure_stop_id = call.departure_stop_id
+        arrival_stop_id = call.arrival_stop_id
+
+    move_vehicle_to_stop(
+        call_id=call_id,
+        target_stop_id=departure_stop_id,
+        call_status=CallStatus.APPROACHING,
+    )
+
+    with SessionLocal() as db:
+        call = db.get(Call, call_id)
+
+        if call is None:
+            return
+
+        call.status = CallStatus.ARRIVED.value
+        call.estimated_arrival_seconds = 0
+        db.commit()
+
+    sleep(ARRIVAL_WAIT_SECONDS)
+
+    with SessionLocal() as db:
+        call = db.get(Call, call_id)
+
+        if call is None:
+            return
+
+        call.status = CallStatus.IN_SERVICE.value
+        db.commit()
+
+    move_vehicle_to_stop(
+        call_id=call_id,
+        target_stop_id=arrival_stop_id,
+        call_status=CallStatus.IN_SERVICE,
+    )
+
+    with SessionLocal() as db:
+        call = db.get(Call, call_id)
+
+        if call is None:
+            return
+
+        vehicle = db.get(Vehicle, call.vehicle_id)
+
+        if vehicle is None:
+            return
+
+        arrival_stop = db.get(Stop, call.arrival_stop_id)
+
+        if arrival_stop is None:
+            return
+
+        call.status = CallStatus.COMPLETED.value
+        call.estimated_arrival_seconds = 0
+
+        vehicle.latitude = arrival_stop.latitude
+        vehicle.longitude = arrival_stop.longitude
+        vehicle.nearest_stop_id = arrival_stop.id
+        vehicle.status = VehicleStatus.AVAILABLE.value
+        vehicle.current_call_id = None
+
+        db.commit()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -259,9 +439,53 @@ def create_call(
     db.refresh(call)
     db.refresh(vehicle)
 
+    movement_thread = Thread(
+        target=run_vehicle_trip,
+        args=(call.id,),
+        daemon=True,
+    )
+
+    movement_thread.start()
+
     return CallCreateResponse(
         call_id=call.id,
         vehicle_id=vehicle.id,
+        call_status=call.status,
+        estimated_arrival_seconds=call.estimated_arrival_seconds,
+        vehicle_latitude=vehicle.latitude,
+        vehicle_longitude=vehicle.longitude,
+        nearest_stop_id=vehicle.nearest_stop_id,
+    )
+
+@app.get(
+    "/calls/{call_id}",
+    response_model=CallStatusResponse,
+)
+def get_call_status(
+    call_id: str,
+    db: Session = Depends(get_db),
+):
+    call = db.get(Call, call_id)
+
+    if call is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="호출 정보를 찾을 수 없습니다.",
+        )
+
+    vehicle = db.get(Vehicle, call.vehicle_id)
+
+    if vehicle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="배차된 차량 정보를 찾을 수 없습니다.",
+        )
+
+    return CallStatusResponse(
+        call_id=call.id,
+        vehicle_id=vehicle.id,
+        departure_stop_id=call.departure_stop_id,
+        arrival_stop_id=call.arrival_stop_id,
         call_status=call.status,
         estimated_arrival_seconds=call.estimated_arrival_seconds,
         vehicle_latitude=vehicle.latitude,
