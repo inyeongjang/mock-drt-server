@@ -176,26 +176,6 @@ def find_nearest_stop(
         ),
     )
 
-def find_nearest_stop(
-    db: Session,
-    latitude: float,
-    longitude: float,
-) -> Stop:
-    stops = db.scalars(select(Stop)).all()
-
-    if not stops:
-        raise RuntimeError("등록된 정류장이 없습니다.")
-
-    return min(
-        stops,
-        key=lambda stop: calculate_distance_km(
-            latitude,
-            longitude,
-            stop.latitude,
-            stop.longitude,
-        ),
-    )
-
 def interpolate_position(
     start: float,
     end: float,
